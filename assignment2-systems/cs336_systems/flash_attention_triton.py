@@ -18,7 +18,9 @@ def flash_fwd_kernel(
     scale,
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
-    K_TILE_SIZE: tl.constexpr,):
+    K_TILE_SIZE: tl.constexpr,
+    IS_CAUSAL: tl.constexpr
+    ):
 
     query_tile_index = tl.program_id(0)
     batch_index = tl.program_id(1)
@@ -44,7 +46,7 @@ def flash_fwd_kernel(
         L_ptr + batch_index * stride_lb,
         shape=(N_QUERIES,),
         strides=(stride_lq,),
-        offsets=(query_tile_index * K_TILE_SIZE,),
+        offsets=(query_tile_index * Q_TILE_SIZE,),
         block_shape=(K_TILE_SIZE,),
         order=(0,),
     )
@@ -58,6 +60,7 @@ def flash_fwd_kernel(
     m_old = tl.zeros((Q_TILE_SIZE,), tl.float32)
     l_old = tl.zeros((Q_TILE_SIZE,), tl.float32)
 
+    q_inds = tl.arange(0, Q_TILE_SIZE) 
     for j in range(Tk):
         K_block_ptr = tl.make_block_ptr(
             K_ptr + batch_index * stride_kb,
@@ -81,6 +84,12 @@ def flash_fwd_kernel(
         tl.device_assert(len(K_block.shape) == 2)
         K_T = tl.trans(K_block) # why cant i give dimensions?
         S_ij = tl.dot(Q_block, K_T) * scale
+
+        k_inds = tl.arange(0, K_TILE_SIZE)
+        if IS_CAUSAL:
+            neg_inf = tl.full((), -1e6, dtype=tl.float32)
+            S_ij = tl.where(q_inds[:, None] + Q_TILE_SIZE * query_tile_index >= k_inds[None, :] + j * K_TILE_SIZE, S_ij, neg_inf)
+
         tmp = tl.max(S_ij, axis=-1, return_indices=False)
         m_ij = tl.maximum(m_old, tmp)
 
@@ -125,14 +134,36 @@ class FlashAttentionTriton(torch.autograd.Function):
             L.stride(0), L.stride(1),
             Nq, Nk,
             D ** -0.5,
-            D, Bq, Bk
+            D, Bq, Bk, is_causal
             )
 
         ctx.save_for_backward(L, Q, K, V, O)
+        ctx.is_causal = is_causal
         print(O)
         print(torch.sum(O.eq(torch.zeros_like(O))))
         return O
 
     @staticmethod
-    def backward(ctx):
-        pass
+    def backward(ctx, dO):
+        L, Q, K, V, O = ctx.saved_tensors
+
+        is_causal = ctx.is_causal
+
+        D = torch.sum(O * dO, -1)
+        d = Q.shape[-1]
+        K_T = rearrange(K, "b s d -> b d s")
+        S = Q @ K_T * (d**-0.5)
+        
+        if is_causal:
+            seq = S.shape[1]
+            mask = ~torch.triu(torch.ones(seq, seq, dtype=torch.bool), diagonal=1).to(device=S.device)
+            S = S.masked_fill(mask == 0, -float('inf'))
+        P = torch.exp(S - L.unsqueeze(-1))
+
+        dV = rearrange(P, "b s d -> b d s") @ dO
+        dP = dO @ rearrange(V, "b s d -> b d s")
+        dS = P * (dP - D.unsqueeze(-1))
+        dQ = dS @ K * (d**-0.5)
+        dK = rearrange(dS, "b s d -> b d s") @ Q * (d**-0.5)
+
+        return dQ, dK, dV, None
