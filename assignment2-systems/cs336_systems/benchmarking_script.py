@@ -215,6 +215,62 @@ def end_to_end_benchmark(args):
     print(df.to_latex(index=False))
 
 
+def flash_benchmarking():
+    from itertools import product
+    seqs = [128, 1024, 8192, 32768]
+    emb_dims = [16, 64, 128]
+    mixed_precisions = [False, True]
+    records = []
+    import triton
+    from cs336_systems.flash_attention_triton import flash_fwd_kernel, FlashAttentionTriton
+    from cs336_basics.model import scaled_dot_product_attention
+    from cs336_basics.optimizer import AdamW
+
+
+    BATCH_SIZE = 1
+    for seq, emb_dim, mixed in product(seqs, emb_dims, mixed_precisions): 
+        Q = torch.randn(BATCH_SIZE, seq, emb_dim, requires_grad=True).to("cuda")
+        K = torch.randn(BATCH_SIZE, seq, emb_dim, requires_grad=True).to("cuda")
+        V = torch.randn(BATCH_SIZE, seq, emb_dim, requires_grad=True).to("cuda")
+
+        with torch.amp.autocast("cuda", torch.bfloat16) if mixed else nullcontext():
+            trit_fwd = triton.testing.do_bench(lambda: FlashAttentionTriton.apply(Q, K, V))
+            out = FlashAttentionTriton.apply(Q, K, V)
+            trit_bwd = triton.testing.do_bench(lambda: out.sum().backward(retain_graph=True))
+            def both_pass():
+                out = FlashAttentionTriton.apply(Q, K, V)
+                out.sum().backward()
+            trit_both = triton.testing.do_bench(both_pass)
+
+            del out
+
+            pytorch_fwd = triton.testing.do_bench(lambda: scaled_dot_product_attention(Q, K, V))
+            out = scaled_dot_product_attention(Q, K, V)
+            pytorch_bwd = triton.testing.do_bench(lambda: out.sum().backward(retain_graph=True))
+            def both_py_pass():
+                out = scaled_dot_product_attention(Q, K, V)
+                out.sum().backward()
+            pytorch_both = triton.testing.do_bench(both_py_pass)
+
+            record = {
+                "seq": seq,
+                "emb_dim": emb_dim,
+                "mixed": mixed,
+                "py_fwd": pytorch_fwd,
+                "trit_fwd": trit_fwd,
+                "py_bwd": pytorch_bwd,
+                "trit_bwd": trit_bwd,
+                "py_both": pytorch_both,
+                "trit_both": trit_both,
+            }
+            print(record)
+            records.append(record)
+        del Q, K, V
+
+    df = pd.DataFrame(records)
+    print(df)
+    print(df.to_latex(index=False))
+
 if __name__ == "__main__":
     args = get_args()
     args.vocab_sz = 10000
@@ -223,4 +279,5 @@ if __name__ == "__main__":
 
     # attention_benchmark()
     # memory_profile(args)
-    end_to_end_benchmark(args)
+    # end_to_end_benchmark(args)
+    flash_benchmarking()

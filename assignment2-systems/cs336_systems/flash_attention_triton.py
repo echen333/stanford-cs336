@@ -122,8 +122,6 @@ class FlashAttentionTriton(torch.autograd.Function):
         L = torch.empty(b, Nq).to("cuda")
         O = torch.empty(b, Nq, D).to("cuda")
 
-        print(K.shape, "K shape")
-        print(Q.shape, "Q shape")
         flash_fwd_kernel[(triton.cdiv(Nq, Bq), b)](
             Q, K, V,
             O, L,
@@ -139,8 +137,6 @@ class FlashAttentionTriton(torch.autograd.Function):
 
         ctx.save_for_backward(L, Q, K, V, O)
         ctx.is_causal = is_causal
-        print(O)
-        print(torch.sum(O.eq(torch.zeros_like(O))))
         return O
 
     @staticmethod
