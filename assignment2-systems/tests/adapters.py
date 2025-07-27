@@ -57,7 +57,9 @@ def get_ddp_individual_parameters(module: torch.nn.Module) -> torch.nn.Module:
         Instance of a DDP class.
     """
     # For example: return DDPIndividualParameters(module)
-    raise NotImplementedError
+    from cs336_systems.ddp import DDPOverlapWrapper
+
+    return DDPOverlapWrapper(module)
 
 
 def ddp_individual_parameters_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
@@ -72,7 +74,8 @@ def ddp_individual_parameters_on_after_backward(ddp_model: torch.nn.Module, opti
             Optimizer being used with the DDP-wrapped model.
     """
     # For example: ddp_model.finish_gradient_synchronization()
-    raise NotImplementedError
+    # raise NotImplementedError
+    ddp_model.finish_gradient_synchronization()
 
 
 def get_ddp_bucketed(module: torch.nn.Module, bucket_size_mb: float) -> torch.nn.Module:
@@ -93,7 +96,9 @@ def get_ddp_bucketed(module: torch.nn.Module, bucket_size_mb: float) -> torch.nn
     Returns:
         Instance of a DDP class.
     """
-    raise NotImplementedError
+    from cs336_systems.ddp import DDPOverlapBucketed
+
+    return DDPOverlapBucketed(module, bucket_size_mb)
 
 
 def ddp_bucketed_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
@@ -108,7 +113,8 @@ def ddp_bucketed_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.
             Optimizer being used with the DDP-wrapped model.
     """
     # For example: ddp_model.finish_gradient_synchronization()
-    raise NotImplementedError
+    # raise NotImplementedError
+    ddp_model.finish_gradient_synchronization()
 
 
 def ddp_bucketed_on_train_batch_start(ddp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
@@ -121,7 +127,8 @@ def ddp_bucketed_on_train_batch_start(ddp_model: torch.nn.Module, optimizer: tor
         optimizer: torch.optim.Optimizer
             Optimizer being used with the DDP-wrapped model.
     """
-    raise NotImplementedError
+    # raise NotImplementedError
+    pass
 
 
 def get_sharded_optimizer(params, optimizer_cls: Type[torch.optim.Optimizer], **kwargs) -> torch.optim.Optimizer:

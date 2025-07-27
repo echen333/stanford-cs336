@@ -83,8 +83,14 @@ def _naive_ddp(rank, world_size, model_cls):
         ddp_loss: Tensor = loss_fn(ddp_out, ddp_labels)
         ddp_loss.backward()
 
-        for param in ddp_model.parameters():
-            dist.all_reduce(param.grad, async_op=False)
+        from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+
+        grad = _flatten_dense_tensors([x.grad for x in ddp_model.parameters()])
+        dist.all_reduce(grad, async_op=False)
+        for param, val in zip(
+            ddp_model.parameters(), _unflatten_dense_tensors(grad, [x.grad for x in ddp_model.parameters()])
+        ):
+            param.grad = val
             param.grad /= world_size
 
         ddp_optim.step()

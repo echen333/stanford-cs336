@@ -5,6 +5,7 @@ import torch.multiprocessing as mp
 import timeit
 import numpy as np
 import time
+import torch.nn as nn
 import pandas as pd
 
 
@@ -52,6 +53,98 @@ def all_reduce_bench():
             print(f"each object size is {arr_size} MB with world size {world_size}")
 
             benchmark(launch, world_size, nums)
+
+
+class DDPOverlapWrapper(nn.Module):
+    def __init__(self, module: nn.Module):
+        super().__init__()
+        self.module = module
+        self.handles = []
+        for x in module.parameters():
+            if x.requires_grad:
+
+                def my_all_reduce(p):
+                    handle = dist.all_reduce(p, async_op=True, op=dist.ReduceOp.AVG)
+                    self.handles.append(handle)
+
+                x.register_post_accumulate_grad_hook(my_all_reduce)
+        for param in module.parameters():
+            dist.broadcast(param, src=0)
+
+    def forward(self, *inputs, **kwargs):
+        return self.module(*inputs, **kwargs)
+
+    def finish_gradient_synchronization(self):
+        for handle in self.handles:
+            handle.wait()
+        self.handles.clear()
+
+
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+
+
+class DDPOverlapBucketed(nn.Module):
+    def __init__(self, module: nn.Module, bucket_size_mb: float):
+        super().__init__()
+        self.module = module
+        self.handles = []
+        cur_bucket_size = 0
+        cur_bucket = []
+        self.buckets = []
+        self.name_to_bucket_ind = {}
+        self.total_params = 0
+
+        for ind, (name, x) in enumerate(reversed(list(module.named_parameters()))):
+            self.total_params += 1
+            if x.requires_grad:
+                new_bucket_size = cur_bucket_size + x.numel() * x.element_size() / 1e6
+
+                if new_bucket_size > bucket_size_mb:
+                    self.buckets.append(cur_bucket)
+                    cur_bucket = []
+
+                cur_bucket.append(ind)
+                self.name_to_bucket_ind[name] = len(self.buckets)
+
+                def my_all_reduce(p):
+                    print("my name: ", p.name)
+                    bucket_ind = self.name_to_bucket_ind.get(p.name, None)
+                    self.bucket_count[bucket_ind] += 1
+
+                    if self.bucket_count[bucket_ind] == len(self.buckets[bucket_ind]):
+                        # my job to accumulate since im last in bucket
+                        tmp = [
+                            self.module.parameters()[self.total_params - 1 - ind].grad
+                            for ind in self.buckets[bucket_ind]
+                        ]
+                        grad = _flatten_dense_tensors(tmp)
+                        handle = dist.all_reduce(grad, async_op=True, op=dist.ReduceOp.AVG)
+                        for param_grad, val in zip(
+                            tmp,
+                            _unflatten_dense_tensors(grad, tmp),
+                        ):
+                            param_grad = val
+
+                        self.handles.append(handle)
+
+                x.register_post_accumulate_grad_hook(my_all_reduce)
+
+        if len(cur_bucket) > 0:
+            self.buckets.append(cur_bucket)
+        self.bucket_count = [0 for _ in range(len(self.buckets))]
+
+        for param in module.parameters():
+            # should also do this with bucketing but is one time cost on init
+            dist.broadcast(param, src=0)
+
+    def forward(self, *inputs, **kwargs):
+        return self.module(*inputs, **kwargs)
+
+    def finished_gradient_synchronization(self):
+        for handle in self.handles:
+            handle.wait()
+        self.handles.clear()
+        self.bucket_count = [0 for _ in range(len(self.buckets))]
 
 
 def naive_ddp():
