@@ -5,7 +5,6 @@ from typing import Type
 import torch
 
 
-
 def get_flashattention_autograd_function_pytorch() -> Type:
     """
     Returns a torch.autograd.Function subclass that implements RMSNorm.
@@ -16,7 +15,9 @@ def get_flashattention_autograd_function_pytorch() -> Type:
         A class object (not an instance of the class)
     """
     # For example: return MyRMSNormAutogradFunctionClass
-    raise NotImplementedError
+    from cs336_systems.flash_attention import FlashAttention
+
+    return FlashAttention
 
 
 def get_flashattention_autograd_function_triton() -> Type:
