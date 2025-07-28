@@ -8,6 +8,7 @@ import time
 import torch.nn as nn
 import pandas as pd
 from functools import partial
+import pdb
 
 
 def _setup_process_group(rank, world_size, backend):
@@ -50,7 +51,7 @@ def distributed_all_reduce_bench(rank, world_size, arr_size, backend):
     if rank == 0:
         arr = np.array(obj_list)
         print(f"mean time: {arr.mean()}")
-    
+
     _cleanup_process_group()
 
 
@@ -65,13 +66,20 @@ def benchmark(fn, *args, num_warmups=5, num_trials=10):
 
 def all_reduce_bench():
     tests = [("nccl", 25e4, 2), ("nccl", 25e5, 2), ("nccl", 25e6, 2), ("nccl", 25e7, 2)]
-    tests.extend([
-            ("gloo", 25e7, 2), ("gloo", 25e7, 4), ("gloo", 25e7, 6),
-            ("nccl", 25e7, 2), ("nccl", 25e7, 4), ("nccl", 25e7, 6),
-            ])
+    tests.extend(
+        [
+            ("gloo", 25e7, 2),
+            ("gloo", 25e7, 4),
+            ("gloo", 25e7, 6),
+            ("nccl", 25e7, 2),
+            ("nccl", 25e7, 4),
+            ("nccl", 25e7, 6),
+        ]
+    )
 
     for backend, nums, world_size in tests:
         nums = int(nums)
+
         def launch(world_size, nums):
             mp.spawn(distributed_all_reduce_bench, args=(world_size, nums, backend), nprocs=world_size, join=True)
 
@@ -120,46 +128,55 @@ class DDPOverlapBucketed(nn.Module):
         cur_bucket = []
         self.buckets = []
         self.total_params = 0
+        self.flats = {}
 
-        for ind, (name, x) in enumerate(reversed(list(module.named_parameters()))):
+        for ind, x in reversed(list(enumerate(module.parameters()))):
             self.total_params += 1
             if x.requires_grad:
                 new_bucket_size = cur_bucket_size + x.numel() * x.element_size() / 1e6
 
+                # this bucketing system is not really fair for really large params, doesnt split
                 if new_bucket_size > bucket_size_mb:
-                    self.buckets.append(cur_bucket)
+                    if len(cur_bucket) > 0:
+                        self.buckets.append(cur_bucket)
                     cur_bucket = []
+                    cur_bucket_size = 0
+                else:
+                    cur_bucket_size = new_bucket_size
 
+                print(f"ind {ind} for rank {dist.get_rank()}")
                 cur_bucket.append(ind)
 
                 def my_all_reduce(p, ind, bucket_ind):
                     self.bucket_count[bucket_ind] += 1
+                    # print(f"rank {dist.get_rank()} now has {self.bucket_count[bucket_ind]} for bkt_ind {bucket_ind}")
 
                     if self.bucket_count[bucket_ind] == len(self.buckets[bucket_ind]):
                         # my job to accumulate since im last in bucket
                         print(f"BUCKET FILLED rank {dist.get_rank()}, bucket_ind: {bucket_ind}, ind {ind}")
-                        print("self buckets", self.buckets, self.total_params)
                         for ind in self.buckets[bucket_ind]:
-                            p = list(self.module.parameters())[self.total_params - 1 - ind]
+                            p = list(self.module.parameters())[ind]
                             p.grad /= dist.get_world_size()
 
-                        grads = [
-                            list(self.module.parameters())[self.total_params - 1 - ind].grad for ind in self.buckets[bucket_ind]
-                        ]
+                        grads = [list(self.module.parameters())[ind].grad for ind in self.buckets[bucket_ind]]
                         flat_grad = _flatten_dense_tensors(grads)
+                        print(
+                            f"for rank {dist.get_rank()} {flat_grad.view(-1)[:5]} for bucket_ind {bucket_ind} ind {ind}"
+                        )
                         handle = dist.all_reduce(flat_grad, async_op=True)
+                        self.handles.append(handle)
+                        self.flats[bucket_ind] = flat_grad
+
+                        # print(f"rank {dist.get_rank()} received flat_grad {flat_grad.view(-1)[:5]}")
                         unflat = _unflatten_dense_tensors(flat_grad, grads)
 
-                        for param_grad, val in zip(
-                            grads,
-                            unflat
-                        ):
-                            print(param_grad.shape, "param_grad", f"rank {dist.get_rank()}", param_grad.view(-1)[:5])
+                        grads = [list(self.module.parameters())[ind].grad for ind in self.buckets[bucket_ind]]
+                        for param_grad, val in zip(grads, unflat):
+                            # print(param_grad.shape, "param_grad", f"rank {dist.get_rank()}", param_grad.view(-1)[:5])
                             param_grad = val
 
-                        self.handles.append(handle)
-
                 x.register_post_accumulate_grad_hook(partial(my_all_reduce, ind=ind, bucket_ind=len(self.buckets)))
+        print("self buckets", self.buckets, self.total_params)
 
         if len(cur_bucket) > 0:
             self.buckets.append(cur_bucket)
@@ -169,13 +186,29 @@ class DDPOverlapBucketed(nn.Module):
             dist.broadcast(param.data, src=0)
 
     def forward(self, *inputs, **kwargs):
+        # print(f"done forward on rank{dist.get_rank()}")
         return self.module(*inputs, **kwargs)
 
     def finish_gradient_synchronization(self):
         for handle in self.handles:
             handle.wait()
+        # print(f"finished waiting for rank{dist.get_rank()}")
         self.handles.clear()
+
+        # after communicated, unflatten
+        # for bucket_ind in range(len(self.buckets)):
+        #     flat_grad = self.flats[bucket_ind]
+        #     # print(f"rank {dist.get_rank()} received flat_grad {flat_grad.view(-1)[:5]}")
+        #     grads = [list(self.module.parameters())[ind].grad for ind in self.buckets[bucket_ind]]
+        #     unflat = _unflatten_dense_tensors(flat_grad, grads)
+
+        #     for param_grad, val in zip(grads, unflat):
+        #         # print(param_grad.shape, "param_grad", f"rank {dist.get_rank()}", param_grad.view(-1)[:5])
+        #         param_grad = val
+        #         # print(f"AF param grad {param_grad.view(-1)[:5]} with rank {dist.get_rank()}")
+
         self.bucket_count = [0 for _ in range(len(self.buckets))]
+
 
 if __name__ == "__main__":
     all_reduce_bench()
