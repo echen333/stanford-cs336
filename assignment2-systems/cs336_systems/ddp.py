@@ -7,6 +7,7 @@ import numpy as np
 import time
 import torch.nn as nn
 import pandas as pd
+from functools import partial
 
 
 def _setup_process_group(rank, world_size, backend):
@@ -89,12 +90,14 @@ class DDPOverlapWrapper(nn.Module):
             if x.requires_grad:
 
                 def my_all_reduce(p):
-                    handle = dist.all_reduce(p, async_op=True, op=dist.ReduceOp.AVG)
+                    p.grad /= dist.get_world_size()
+                    handle = dist.all_reduce(p.grad, async_op=True)
                     self.handles.append(handle)
 
                 x.register_post_accumulate_grad_hook(my_all_reduce)
-        for param in module.parameters():
-            dist.broadcast(param, src=0)
+
+        for param in self.module.parameters():
+            dist.broadcast(param.data, src=0)
 
     def forward(self, *inputs, **kwargs):
         return self.module(*inputs, **kwargs)
@@ -131,50 +134,44 @@ class DDPOverlapBucketed(nn.Module):
                 cur_bucket.append(ind)
                 self.name_to_bucket_ind[name] = len(self.buckets)
 
-                def my_all_reduce(p):
-                    print("my name: ", p.name)
-                    bucket_ind = self.name_to_bucket_ind.get(p.name, None)
+                def my_all_reduce(p, ind, bucket_ind):
                     self.bucket_count[bucket_ind] += 1
 
                     if self.bucket_count[bucket_ind] == len(self.buckets[bucket_ind]):
                         # my job to accumulate since im last in bucket
-                        tmp = [
-                            self.module.parameters()[self.total_params - 1 - ind].grad
+                        grads = [
+                            list(self.module.parameters())[self.total_params - 1 - ind].grad / dist.get_world_size()
                             for ind in self.buckets[bucket_ind]
                         ]
-                        grad = _flatten_dense_tensors(tmp)
-                        handle = dist.all_reduce(grad, async_op=True, op=dist.ReduceOp.AVG)
+                        flat_grad = _flatten_dense_tensors(grads)
+                        handle = dist.all_reduce(flat_grad, async_op=True)
+                        unflat = _unflatten_dense_tensors(flat_grad, grads)
+
                         for param_grad, val in zip(
-                            tmp,
-                            _unflatten_dense_tensors(grad, tmp),
+                            grads,
+                            unflat
                         ):
                             param_grad = val
 
                         self.handles.append(handle)
 
-                x.register_post_accumulate_grad_hook(my_all_reduce)
+                x.register_post_accumulate_grad_hook(partial(my_all_reduce, ind=ind, bucket_ind=len(self.buckets)))
 
         if len(cur_bucket) > 0:
             self.buckets.append(cur_bucket)
         self.bucket_count = [0 for _ in range(len(self.buckets))]
 
         for param in module.parameters():
-            # should also do this with bucketing but is one time cost on init
-            dist.broadcast(param, src=0)
+            dist.broadcast(param.data, src=0)
 
     def forward(self, *inputs, **kwargs):
         return self.module(*inputs, **kwargs)
 
-    def finished_gradient_synchronization(self):
+    def finish_gradient_synchronization(self):
         for handle in self.handles:
             handle.wait()
         self.handles.clear()
         self.bucket_count = [0 for _ in range(len(self.buckets))]
-
-
-def naive_ddp():
-    pass
-
 
 if __name__ == "__main__":
     all_reduce_bench()

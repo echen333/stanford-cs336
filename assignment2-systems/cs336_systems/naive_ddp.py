@@ -59,14 +59,14 @@ def get_args():
         d_ff= 10240,
         num_layers= 32,
         num_heads= 32,
-        context_len= 128,
+        context_len=32,
         vocab_sz= 10000,
         rope_theta=10000,
         batch_size=64,
     )
     return args
 
-def _train_xl_ddp_benchmark(rank, world_size, model_cls, args):
+def _train_xl_ddp_benchmark(rank, world_size, model_cls, args, model_wrap=True):
     device = _setup_process_group(rank, world_size, "nccl")
     dist.barrier()
     torch.manual_seed(rank)
@@ -74,18 +74,27 @@ def _train_xl_ddp_benchmark(rank, world_size, model_cls, args):
     model = model_cls(
         args.vocab_sz, args.context_len, args.d_model, args.num_layers, args.num_heads, args.d_ff, args.rope_theta
     ).to(device)
+    
+    from cs336_systems.ddp import DDPOverlapWrapper
+    if model_wrap:
+        model = DDPOverlapWrapper(model)
+
+    for param in model.parameters():
+        dist.broadcast(param, src=0)
     optimizer = AdamW(model.parameters())
 
-    arr = np.array(torch.randint(0, 10000, (args.context_len * 20,)))
+    arr = np.array(torch.randint(0, 10000, (args.context_len * 2,)))
     x, y = get_batch(arr, args.batch_size, args.context_len, device)
     local_bs = x.size(0) // world_size
     offset = rank * local_bs
 
-    for i in range(5):
-        arr = np.array(torch.randint(0, 10000, (args.context_len * 20,)))
 
-        print(f"shape x,y {x.shape}, {y.shape}")
-
+    sum_elapsed = 0
+    num_steps = 50
+    print(f"starting model for {num_steps} steps")
+    torch.cuda.synchronize()
+    model_start_time = time.time()
+    for i in range(num_steps):
         ddp_data = x[offset : offset + local_bs, :]
         ddp_labels = y[offset : offset + local_bs, :]
         out = model(ddp_data)
@@ -99,20 +108,35 @@ def _train_xl_ddp_benchmark(rank, world_size, model_cls, args):
         for param in model.parameters():
             dist.all_reduce(param.grad, async_op=False)
             param.grad /= world_size
+
+        # from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+        
+        # grads = [p.grad for p in model.parameters() if p.grad is not None]
+        # grad_flat = _flatten_dense_tensors(grads)
+        # dist.all_reduce(grad_flat, async_op=False)
+        # unflat = _unflatten_dense_tensors(grad_flat, grads)
+        # for param, val in zip(
+        #     model.parameters(), unflat
+        # ):
+        #     param.grad = oal
+        #     param.grad /= world_size
+
         torch.cuda.synchronize()
         elapsed = time.time() - start_time
-        print(f"elapsed communicating {elapsed}")
+        sum_elapsed += elapsed
 
         optimizer.step()
         torch.cuda.synchronize()
 
         torch.manual_seed(42 + i)
         shuffled_indices = torch.randperm(x.size(0))
-        x = y[shuffled_indices]
-        x = y[shuffled_indices]
+        x = x[shuffled_indices]
+        y = y[shuffled_indices]
 
-        for p in model.parameters():
-            print(f"ind {i} has params {p.view(-1)[:5]}")
+    torch.cuda.synchronize()
+    model_elapsed = time.time() - model_start_time
+    print(f"avg elapsed time {sum_elapsed / num_steps}")
+    print(f"avg model epoch time {model_elapsed / num_steps}")
     _cleanup_process_group()
 
 
@@ -161,15 +185,6 @@ def _naive_ddp(rank, world_size, model_cls):
         ddp_loss: Tensor = loss_fn(ddp_out, ddp_labels)
         ddp_loss.backward()
 
-        # from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
-        # grad = _flatten_dense_tensors([x.grad for x in ddp_model.parameters()])
-        # dist.all_reduce(grad, async_op=False)
-        # for param, val in zip(
-        #     ddp_model.parameters(), _unflatten_dense_tensors(grad, [x.grad for x in ddp_model.parameters()])
-        # ):
-        #     param.grad = val
-        #     param.grad /= world_size
-
         torch.cuda.synchronize()
         start_time = time.time()
         for param in ddp_model.parameters():
@@ -200,7 +215,7 @@ def naive_ddp():
 
     # mp.spawn(_naive_ddp, args=(world_size, ToyModel), nprocs=2, join=True)
     args = get_args()
-    mp.spawn(_train_xl_ddp_benchmark, args=(world_size, BasicsTransformerLM, args), nprocs=2, join=True)
+    mp.spawn(_train_xl_ddp_benchmark, args=(world_size, BasicsTransformerLM, args, True), nprocs=2, join=True)
 
 
 if __name__ == "__main__":
