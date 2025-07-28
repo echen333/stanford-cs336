@@ -120,6 +120,7 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 
 class DDPOverlapBucketed(nn.Module):
+    # TODO: can just store param pointers in each bucket of self.buckets
     def __init__(self, module: nn.Module, bucket_size_mb: float):
         super().__init__()
         self.module = module
@@ -129,13 +130,14 @@ class DDPOverlapBucketed(nn.Module):
         self.buckets = []
         self.total_params = 0
         self.flats = {}
+        self.module_params = list(module.parameters())
 
-        for ind, x in reversed(list(enumerate(module.parameters()))):
+        for ind, x in reversed(list(enumerate(self.module_params))):
             self.total_params += 1
             if x.requires_grad:
                 new_bucket_size = cur_bucket_size + x.numel() * x.element_size() / 1e6
 
-                # this bucketing system is not really fair for really large params, doesnt split
+                # bucketing system doesnt split up same layer
                 if new_bucket_size > bucket_size_mb:
                     if len(cur_bucket) > 0:
                         self.buckets.append(cur_bucket)
@@ -144,68 +146,46 @@ class DDPOverlapBucketed(nn.Module):
                 else:
                     cur_bucket_size = new_bucket_size
 
-                print(f"ind {ind} for rank {dist.get_rank()}")
                 cur_bucket.append(ind)
 
                 def my_all_reduce(p, ind, bucket_ind):
                     self.bucket_count[bucket_ind] += 1
-                    # print(f"rank {dist.get_rank()} now has {self.bucket_count[bucket_ind]} for bkt_ind {bucket_ind}")
 
                     if self.bucket_count[bucket_ind] == len(self.buckets[bucket_ind]):
                         # my job to accumulate since im last in bucket
-                        print(f"BUCKET FILLED rank {dist.get_rank()}, bucket_ind: {bucket_ind}, ind {ind}")
-                        for ind in self.buckets[bucket_ind]:
-                            p = list(self.module.parameters())[ind]
-                            p.grad /= dist.get_world_size()
-
-                        grads = [list(self.module.parameters())[ind].grad for ind in self.buckets[bucket_ind]]
+                        grads = [self.module_params[ind].grad for ind in self.buckets[bucket_ind]]
                         flat_grad = _flatten_dense_tensors(grads)
-                        print(
-                            f"for rank {dist.get_rank()} {flat_grad.view(-1)[:5]} for bucket_ind {bucket_ind} ind {ind}"
-                        )
+                        flat_grad /= dist.get_world_size()
                         handle = dist.all_reduce(flat_grad, async_op=True)
                         self.handles.append(handle)
                         self.flats[bucket_ind] = flat_grad
 
-                        # print(f"rank {dist.get_rank()} received flat_grad {flat_grad.view(-1)[:5]}")
-                        unflat = _unflatten_dense_tensors(flat_grad, grads)
-
-                        grads = [list(self.module.parameters())[ind].grad for ind in self.buckets[bucket_ind]]
-                        for param_grad, val in zip(grads, unflat):
-                            # print(param_grad.shape, "param_grad", f"rank {dist.get_rank()}", param_grad.view(-1)[:5])
-                            param_grad = val
-
-                x.register_post_accumulate_grad_hook(partial(my_all_reduce, ind=ind, bucket_ind=len(self.buckets)))
-        print("self buckets", self.buckets, self.total_params)
+                bucket_ind = len(self.buckets)
+                x.register_post_accumulate_grad_hook(partial(my_all_reduce, ind=ind, bucket_ind=bucket_ind))
 
         if len(cur_bucket) > 0:
             self.buckets.append(cur_bucket)
         self.bucket_count = [0 for _ in range(len(self.buckets))]
 
-        for param in module.parameters():
+        for param in self.module_params:
             dist.broadcast(param.data, src=0)
 
     def forward(self, *inputs, **kwargs):
-        # print(f"done forward on rank{dist.get_rank()}")
         return self.module(*inputs, **kwargs)
 
     def finish_gradient_synchronization(self):
         for handle in self.handles:
             handle.wait()
-        # print(f"finished waiting for rank{dist.get_rank()}")
         self.handles.clear()
 
         # after communicated, unflatten
-        # for bucket_ind in range(len(self.buckets)):
-        #     flat_grad = self.flats[bucket_ind]
-        #     # print(f"rank {dist.get_rank()} received flat_grad {flat_grad.view(-1)[:5]}")
-        #     grads = [list(self.module.parameters())[ind].grad for ind in self.buckets[bucket_ind]]
-        #     unflat = _unflatten_dense_tensors(flat_grad, grads)
+        for bucket_ind in range(len(self.buckets)):
+            flat_grad = self.flats[bucket_ind]
+            grads = [self.module_params[ind].grad for ind in self.buckets[bucket_ind]]
+            unflat = _unflatten_dense_tensors(flat_grad, grads)
 
-        #     for param_grad, val in zip(grads, unflat):
-        #         # print(param_grad.shape, "param_grad", f"rank {dist.get_rank()}", param_grad.view(-1)[:5])
-        #         param_grad = val
-        #         # print(f"AF param grad {param_grad.view(-1)[:5]} with rank {dist.get_rank()}")
+            for param_grad, val in zip(grads, unflat):
+                param_grad.copy_(val)
 
         self.bucket_count = [0 for _ in range(len(self.buckets))]
 
