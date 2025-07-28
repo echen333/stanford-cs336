@@ -119,7 +119,6 @@ class DDPOverlapBucketed(nn.Module):
         cur_bucket_size = 0
         cur_bucket = []
         self.buckets = []
-        self.name_to_bucket_ind = {}
         self.total_params = 0
 
         for ind, (name, x) in enumerate(reversed(list(module.named_parameters()))):
@@ -132,16 +131,20 @@ class DDPOverlapBucketed(nn.Module):
                     cur_bucket = []
 
                 cur_bucket.append(ind)
-                self.name_to_bucket_ind[name] = len(self.buckets)
 
                 def my_all_reduce(p, ind, bucket_ind):
                     self.bucket_count[bucket_ind] += 1
 
                     if self.bucket_count[bucket_ind] == len(self.buckets[bucket_ind]):
                         # my job to accumulate since im last in bucket
+                        print(f"BUCKET FILLED rank {dist.get_rank()}, bucket_ind: {bucket_ind}, ind {ind}")
+                        print("self buckets", self.buckets, self.total_params)
+                        for ind in self.buckets[bucket_ind]:
+                            p = list(self.module.parameters())[self.total_params - 1 - ind]
+                            p.grad /= dist.get_world_size()
+
                         grads = [
-                            list(self.module.parameters())[self.total_params - 1 - ind].grad / dist.get_world_size()
-                            for ind in self.buckets[bucket_ind]
+                            list(self.module.parameters())[self.total_params - 1 - ind].grad for ind in self.buckets[bucket_ind]
                         ]
                         flat_grad = _flatten_dense_tensors(grads)
                         handle = dist.all_reduce(flat_grad, async_op=True)
@@ -151,6 +154,7 @@ class DDPOverlapBucketed(nn.Module):
                             grads,
                             unflat
                         ):
+                            print(param_grad.shape, "param_grad", f"rank {dist.get_rank()}", param_grad.view(-1)[:5])
                             param_grad = val
 
                         self.handles.append(handle)
