@@ -9,28 +9,48 @@ import torch.nn as nn
 import pandas as pd
 
 
-def setup(rank, world_size):
+def _setup_process_group(rank, world_size, backend):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "29500"
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    if torch.cuda.is_available():
+        device_count = torch.cuda.device_count()
+        if device_count > 0:
+            local_rank = rank % world_size
+            torch.cuda.set_device(local_rank)
+        else:
+            raise ValueError("Cuda device not found")
+        device = f"cuda:{local_rank}"
+    else:
+        device = "cpu"
+
+    dist.init_process_group(backend, rank=rank, world_size=world_size)
+    return device
 
 
-def distributed_all_reduce_bench(rank, world_size, arr_size):
-    setup(rank, world_size)
-    data = torch.randn(arr_size)
+def _cleanup_process_group():
+    # Synchronize before we destroy the process group
+    dist.barrier()
+    dist.destroy_process_group()
 
-    # torch.cuda.synchronize()
+
+def distributed_all_reduce_bench(rank, world_size, arr_size, backend):
+    device = _setup_process_group(rank, world_size, backend)
+    data = torch.randn(arr_size).to(device)
+
+    torch.cuda.synchronize()
     start_time = time.time()
     dist.all_reduce(data, async_op=False)
+    torch.cuda.synchronize()
     elapsed = time.time() - start_time
     # print(f"rank {rank} has elapsed {elapsed}")
     obj_list = [None for _ in range(world_size)]
     dist.all_gather_object(obj_list, elapsed)
-    # torch.cuda.synchronize()
 
     if rank == 0:
         arr = np.array(obj_list)
         print(f"mean time: {arr.mean()}")
+    
+    _cleanup_process_group()
 
 
 def benchmark(fn, *args, num_warmups=5, num_trials=10):
@@ -43,16 +63,21 @@ def benchmark(fn, *args, num_warmups=5, num_trials=10):
 
 
 def all_reduce_bench():
-    for nums in [int(x) for x in [25e4, 25e5, 25e6, 25e7]]:
-        for world_size in [2, 4, 6]:
+    tests = [("nccl", 25e4, 2), ("nccl", 25e5, 2), ("nccl", 25e6, 2), ("nccl", 25e7, 2)]
+    tests.extend([
+            ("gloo", 25e7, 2), ("gloo", 25e7, 4), ("gloo", 25e7, 6),
+            ("nccl", 25e7, 2), ("nccl", 25e7, 4), ("nccl", 25e7, 6),
+            ])
 
-            def launch(world_size, nums):
-                mp.spawn(distributed_all_reduce_bench, args=(world_size, nums), nprocs=world_size, join=True)
+    for backend, nums, world_size in tests:
+        nums = int(nums)
+        def launch(world_size, nums):
+            mp.spawn(distributed_all_reduce_bench, args=(world_size, nums, backend), nprocs=world_size, join=True)
 
-            arr_size = 4 * nums / 1e6
-            print(f"each object size is {arr_size} MB with world size {world_size}")
+        arr_size = 4 * nums / 1e6
+        print(f"each object size is {arr_size} MB with world size {world_size} with backend {backend}")
 
-            benchmark(launch, world_size, nums)
+        benchmark(launch, world_size, nums)
 
 
 class DDPOverlapWrapper(nn.Module):

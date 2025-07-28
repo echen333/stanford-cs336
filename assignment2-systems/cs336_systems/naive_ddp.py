@@ -5,15 +5,22 @@ import os
 import torch.nn as nn
 from copy import deepcopy
 from torch import Tensor
+import time
+
+from cs336_basics.model import BasicsTransformerLM
+from cs336_basics.nn_utils import cross_entropy
+from cs336_basics.data import get_batch
+from cs336_basics.optimizer import AdamW
 
 
 def _setup_process_group(rank, world_size, backend):
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "29500"
+    os.environ["MASTER_PORT"] = "29510"
     if torch.cuda.is_available():
         device_count = torch.cuda.device_count()
         if device_count > 0:
-            local_rank = device_count % world_size
+            local_rank = rank % world_size
+            torch.cuda.set_device(local_rank)
         else:
             raise ValueError("Cuda device not found")
         device = f"cuda:{local_rank}"
@@ -23,6 +30,10 @@ def _setup_process_group(rank, world_size, backend):
     dist.init_process_group(backend, rank=rank, world_size=world_size)
     return device
 
+
+def _cleanup_process_group():
+    dist.barrier()
+    dist.destroy_process_group()
 
 class ToyModel(nn.Module):
     def __init__(self):
@@ -38,8 +49,11 @@ class ToyModel(nn.Module):
         return out2
 
 
+def _naive_ddp_benchmark(rank, world_size, model_cls):
+    pass
+
 def _naive_ddp(rank, world_size, model_cls):
-    device = _setup_process_group(rank, world_size, "gloo")
+    device = _setup_process_group(rank, world_size, "nccl")
     dist.barrier()
 
     torch.manual_seed(rank)
@@ -47,7 +61,7 @@ def _naive_ddp(rank, world_size, model_cls):
     non_parallel_model = model_cls().to(device)
     non_parallel_optim = torch.optim.SGD(non_parallel_model.parameters())
 
-    ddp_model = deepcopy(non_parallel_model)
+    ddp_model = deepcopy(non_parallel_model).to(device)
     ddp_optim = torch.optim.SGD(ddp_model.parameters())
 
     # broadcast to other from rank 0
@@ -57,8 +71,8 @@ def _naive_ddp(rank, world_size, model_cls):
         dist.broadcast(param, src=0)
 
     # Optimizing on same data
-    all_x = torch.load("cs336_systems/data/all_x_fixture.pt")
-    all_y = torch.load("cs336_systems/data/all_y_fixture.pt")
+    all_x = torch.load("cs336_systems/data/all_x_fixture.pt").to(device)
+    all_y = torch.load("cs336_systems/data/all_y_fixture.pt").to(device)
 
     local_bs = all_x.size(0) // world_size
     offset = rank * local_bs
@@ -83,15 +97,23 @@ def _naive_ddp(rank, world_size, model_cls):
         ddp_loss: Tensor = loss_fn(ddp_out, ddp_labels)
         ddp_loss.backward()
 
-        from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+        # from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+        # grad = _flatten_dense_tensors([x.grad for x in ddp_model.parameters()])
+        # dist.all_reduce(grad, async_op=False)
+        # for param, val in zip(
+        #     ddp_model.parameters(), _unflatten_dense_tensors(grad, [x.grad for x in ddp_model.parameters()])
+        # ):
+        #     param.grad = val
+        #     param.grad /= world_size
 
-        grad = _flatten_dense_tensors([x.grad for x in ddp_model.parameters()])
-        dist.all_reduce(grad, async_op=False)
-        for param, val in zip(
-            ddp_model.parameters(), _unflatten_dense_tensors(grad, [x.grad for x in ddp_model.parameters()])
-        ):
-            param.grad = val
+        torch.cuda.synchronize()
+        start_time = time.time()
+        for param in ddp_model.parameters():
+            dist.all_reduce(param.grad, async_op=False)
             param.grad /= world_size
+        torch.cuda.synchronize()
+        elapsed = time.time() - start_time
+        print(f"elapsed communicating {elapsed}")
 
         ddp_optim.step()
 
@@ -104,6 +126,8 @@ def _naive_ddp(rank, world_size, model_cls):
         shuffled_indices = torch.randperm(all_x.size(0))
         all_x = all_x[shuffled_indices]
         all_y = all_y[shuffled_indices]
+    
+    _cleanup_process_group()
 
 
 def naive_ddp():
