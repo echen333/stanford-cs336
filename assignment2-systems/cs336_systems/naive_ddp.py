@@ -6,6 +6,9 @@ import torch.nn as nn
 from copy import deepcopy
 from torch import Tensor
 import time
+import numpy as np
+import argparse
+from contextlib import nullcontext
 
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.nn_utils import cross_entropy
@@ -49,8 +52,69 @@ class ToyModel(nn.Module):
         return out2
 
 
-def _naive_ddp_benchmark(rank, world_size, model_cls):
-    pass
+def get_args():
+    from argparse import Namespace
+    args = Namespace(
+        d_model= 2560,
+        d_ff= 10240,
+        num_layers= 32,
+        num_heads= 32,
+        context_len= 128,
+        vocab_sz= 10000,
+        rope_theta=10000,
+        batch_size=64,
+    )
+    return args
+
+def _train_xl_ddp_benchmark(rank, world_size, model_cls, args):
+    device = _setup_process_group(rank, world_size, "nccl")
+    dist.barrier()
+    torch.manual_seed(rank)
+
+    model = model_cls(
+        args.vocab_sz, args.context_len, args.d_model, args.num_layers, args.num_heads, args.d_ff, args.rope_theta
+    ).to(device)
+    optimizer = AdamW(model.parameters())
+
+    arr = np.array(torch.randint(0, 10000, (args.context_len * 20,)))
+    x, y = get_batch(arr, args.batch_size, args.context_len, device)
+    local_bs = x.size(0) // world_size
+    offset = rank * local_bs
+
+    for i in range(5):
+        arr = np.array(torch.randint(0, 10000, (args.context_len * 20,)))
+
+        print(f"shape x,y {x.shape}, {y.shape}")
+
+        ddp_data = x[offset : offset + local_bs, :]
+        ddp_labels = y[offset : offset + local_bs, :]
+        out = model(ddp_data)
+        out = out.flatten(0,1)
+        ddp_labels = ddp_labels.flatten(0,1)
+        ddp_loss = cross_entropy(out, ddp_labels)
+        ddp_loss.backward()
+
+        torch.cuda.synchronize()
+        start_time = time.time()
+        for param in model.parameters():
+            dist.all_reduce(param.grad, async_op=False)
+            param.grad /= world_size
+        torch.cuda.synchronize()
+        elapsed = time.time() - start_time
+        print(f"elapsed communicating {elapsed}")
+
+        optimizer.step()
+        torch.cuda.synchronize()
+
+        torch.manual_seed(42 + i)
+        shuffled_indices = torch.randperm(x.size(0))
+        x = y[shuffled_indices]
+        x = y[shuffled_indices]
+
+        for p in model.parameters():
+            print(f"ind {i} has params {p.view(-1)[:5]}")
+    _cleanup_process_group()
+
 
 def _naive_ddp(rank, world_size, model_cls):
     device = _setup_process_group(rank, world_size, "nccl")
@@ -134,7 +198,9 @@ def naive_ddp():
     torch.random.manual_seed(42)
     world_size = 2
 
-    mp.spawn(_naive_ddp, args=(world_size, ToyModel), nprocs=2, join=True)
+    # mp.spawn(_naive_ddp, args=(world_size, ToyModel), nprocs=2, join=True)
+    args = get_args()
+    mp.spawn(_train_xl_ddp_benchmark, args=(world_size, BasicsTransformerLM, args), nprocs=2, join=True)
 
 
 if __name__ == "__main__":
