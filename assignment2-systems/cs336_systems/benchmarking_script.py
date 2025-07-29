@@ -169,9 +169,11 @@ def end_to_end_benchmark(args):
     records = []
     BATCH_SIZE = 4
 
-    for size in ["small", "med", "large", "xlarge", "2.7B"]:
+    # for size in ["small", "med", "large", "xlarge", "2.7B"]:
+    for size in ["2.7B"]:
         record = {"size": size}
-        for compiled in [True, False]:
+        # for compiled in [True, False]:
+        for compiled in [False]:
             SIZE_CONFIGS = {
                 "small": (768, 3072, 12, 12),
                 "med": (1024, 4096, 24, 16),
@@ -202,11 +204,13 @@ def end_to_end_benchmark(args):
                 arr = np.array(torch.randint(0, 10000, (args.context_len * 20,)))
                 x, y = get_batch(arr, BATCH_SIZE, args.context_len, args.device)
 
-                res = benchmark_function(model, x)
-                res2 = benchmark_function(model_pass, model, x, False, y, optimizer)
+                out = model(x)
+                print(f"out", out.view(-1)[:5])
+                # res = benchmark_function(model, x)
+                # res2 = benchmark_function(model_pass, model, x, False, y, optimizer)
 
-                record[f"{'compiled_' if compiled else ''}fwd"] = res
-                record[f"{'compiled_' if compiled else ''}bwd"] = res2
+                # record[f"{'compiled_' if compiled else ''}fwd"] = res
+                # record[f"{'compiled_' if compiled else ''}bwd"] = res2
 
         print(record)
         records.append(record)
@@ -279,5 +283,5 @@ if __name__ == "__main__":
 
     # attention_benchmark()
     # memory_profile(args)
-    # end_to_end_benchmark(args)
-    flash_benchmarking()
+    end_to_end_benchmark(args)
+    # flash_benchmarking()
