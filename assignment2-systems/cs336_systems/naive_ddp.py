@@ -38,6 +38,7 @@ def _cleanup_process_group():
     dist.barrier()
     dist.destroy_process_group()
 
+
 class ToyModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -54,19 +55,21 @@ class ToyModel(nn.Module):
 
 def get_args():
     from argparse import Namespace
+
     args = Namespace(
-        d_model= 2560,
-        d_ff= 10240,
-        num_layers= 32,
-        num_heads= 32,
+        d_model=2560,
+        d_ff=10240,
+        num_layers=32,
+        num_heads=32,
         context_len=32,
-        vocab_sz= 10000,
+        vocab_sz=10000,
         rope_theta=10000,
         batch_size=64,
     )
     return args
 
-def _train_xl_ddp_benchmark(rank, world_size, model_cls, args, model_wrap=True):
+
+def _train_xl_ddp_benchmark(rank, world_size, model_cls, args, model_wrap=True, bucket=False):
     device = _setup_process_group(rank, world_size, "nccl")
     dist.barrier()
     torch.manual_seed(rank)
@@ -74,13 +77,20 @@ def _train_xl_ddp_benchmark(rank, world_size, model_cls, args, model_wrap=True):
     model = model_cls(
         args.vocab_sz, args.context_len, args.d_model, args.num_layers, args.num_heads, args.d_ff, args.rope_theta
     ).to(device)
-    
-    from cs336_systems.ddp import DDPOverlapWrapper
-    if model_wrap:
-        model = DDPOverlapWrapper(model)
+    print(f"initialized {model}")
 
-    for param in model.parameters():
-        dist.broadcast(param, src=0)
+    from cs336_systems.ddp import DDPOverlapWrapper, DDPOverlapBucketed
+    from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+
+    if model_wrap:
+        if bucket:
+            model = DDPOverlapBucketed(model, 250)
+        else:
+            model = DDPOverlapWrapper(model)
+    else:
+        for param in model.parameters():
+            dist.broadcast(param, src=0)
+
     optimizer = AdamW(model.parameters())
 
     arr = np.array(torch.randint(0, 10000, (args.context_len * 2,)))
@@ -88,9 +98,8 @@ def _train_xl_ddp_benchmark(rank, world_size, model_cls, args, model_wrap=True):
     local_bs = x.size(0) // world_size
     offset = rank * local_bs
 
-
     sum_elapsed = 0
-    num_steps = 50
+    num_steps = 20
     print(f"starting model for {num_steps} steps")
     torch.cuda.synchronize()
     model_start_time = time.time()
@@ -98,36 +107,36 @@ def _train_xl_ddp_benchmark(rank, world_size, model_cls, args, model_wrap=True):
         ddp_data = x[offset : offset + local_bs, :]
         ddp_labels = y[offset : offset + local_bs, :]
         out = model(ddp_data)
-        out = out.flatten(0,1)
-        ddp_labels = ddp_labels.flatten(0,1)
+        out = out.flatten(0, 1)
+        ddp_labels = ddp_labels.flatten(0, 1)
         ddp_loss = cross_entropy(out, ddp_labels)
         ddp_loss.backward()
 
-        torch.cuda.synchronize()
-        start_time = time.time()
-        for param in model.parameters():
-            dist.all_reduce(param.grad, async_op=False)
-            param.grad /= world_size
+        if model_wrap:
+            model.finish_gradient_synchronization()
+        else:
+            torch.cuda.synchronize()
+            start_time = time.time()
+            for param in model.parameters():
+                dist.all_reduce(param.grad, async_op=False)
+                param.grad /= world_size
 
-        # from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
-        
-        # grads = [p.grad for p in model.parameters() if p.grad is not None]
-        # grad_flat = _flatten_dense_tensors(grads)
-        # dist.all_reduce(grad_flat, async_op=False)
-        # unflat = _unflatten_dense_tensors(grad_flat, grads)
-        # for param, val in zip(
-        #     model.parameters(), unflat
-        # ):
-        #     param.grad = oal
-        #     param.grad /= world_size
+            grads = [p.grad for p in model.parameters() if p.grad is not None]
+            grad_flat = _flatten_dense_tensors(grads)
+            dist.all_reduce(grad_flat, async_op=False)
+            unflat = _unflatten_dense_tensors(grad_flat, grads)
+            for param, val in zip(model.parameters(), unflat):
+                # am i actually assigning here?
+                param.grad = val
+                param.grad /= world_size
 
-        torch.cuda.synchronize()
-        elapsed = time.time() - start_time
-        sum_elapsed += elapsed
+            torch.cuda.synchronize()
+            elapsed = time.time() - start_time
+            sum_elapsed += elapsed
 
         optimizer.step()
-        torch.cuda.synchronize()
 
+        # print(f"stepp {i}")
         torch.manual_seed(42 + i)
         shuffled_indices = torch.randperm(x.size(0))
         x = x[shuffled_indices]
@@ -205,7 +214,7 @@ def _naive_ddp(rank, world_size, model_cls):
         shuffled_indices = torch.randperm(all_x.size(0))
         all_x = all_x[shuffled_indices]
         all_y = all_y[shuffled_indices]
-    
+
     _cleanup_process_group()
 
 

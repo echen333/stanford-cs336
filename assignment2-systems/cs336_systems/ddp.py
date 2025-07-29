@@ -166,6 +166,7 @@ class DDPOverlapBucketed(nn.Module):
         if len(cur_bucket) > 0:
             self.buckets.append(cur_bucket)
         self.bucket_count = [0 for _ in range(len(self.buckets))]
+        print(f"buckets {self.buckets}")
 
         for param in self.module_params:
             dist.broadcast(param.data, src=0)
