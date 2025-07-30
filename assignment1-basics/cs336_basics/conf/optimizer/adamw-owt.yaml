@@ -1,6 +1,6 @@
 _target_: cs336_basics.utils_train.AdamW
 lr: 1.5e-3
 weight_decay: 0.2
-betas: [0.9, 0.85]
+betas: [0.9, 0.99]
 eps: 1e-8
 warmup_steps: 400

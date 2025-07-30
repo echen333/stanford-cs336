@@ -3,6 +3,6 @@ vocab_size: 32_000
 d_model: 768
 num_heads: 16
 rope_theta: 10_000
-context_length: 256
+context_length: 768
 num_layers: 5
 device: cuda

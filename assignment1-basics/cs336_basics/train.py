@@ -73,6 +73,8 @@ def main(cfg):
     print("model", model)
     print("optim", optim)
 
+    model = torch.compile(model)
+
     artifact = run.use_artifact("eddys/stanford-lm-1/owt-train:v0", type="dataset")
     artifact2 = run.use_artifact("eddys/stanford-lm-1/owt-valid:v0", type="dataset")
     artifact_dir = artifact.download()
