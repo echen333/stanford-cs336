@@ -18,7 +18,7 @@ from cs336_basics.optimizer import AdamW
 
 def _setup_process_group(rank, world_size, backend):
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "29510"
+    os.environ["MASTER_PORT"] = "29511"
     if torch.cuda.is_available():
         device_count = torch.cuda.device_count()
         if device_count > 0:
@@ -61,7 +61,7 @@ def get_args():
         d_ff=10240,
         num_layers=32,
         num_heads=32,
-        context_len=32,
+        context_len=16,
         vocab_sz=10000,
         rope_theta=10000,
         batch_size=64,
@@ -218,13 +218,70 @@ def _naive_ddp(rank, world_size, model_cls):
     _cleanup_process_group()
 
 
+def _mp_memory_profile_shard(rank, world_size, args, num_epochs=100, optimizer_shard=False):
+    _setup_process_group(rank, world_size, "nccl")
+
+    torch.manual_seed(42)
+    torch.cuda.memory._record_memory_history(max_entries=10000000, context=None, stacks="python")
+    args.device = "cuda"
+    print(f"loading model")
+    model = BasicsTransformerLM(
+        args.vocab_sz, args.context_len, args.d_model, args.num_layers, args.num_heads, args.d_ff, args.rope_theta
+    ).to(args.device)
+    print("loaded model")
+
+    if optimizer_shard:
+        from cs336_systems.optimizer_state_shard import OptimizerStateSharding
+
+        optimizer = OptimizerStateSharding(model.parameters(), AdamW)
+    else:
+        optimizer = AdamW(model.parameters())
+
+    BATCH_SIZE = 4
+
+    print(f"running memory profile for {num_epochs} epochs and shard: {optimizer_shard}")
+
+    arr = np.array(torch.randint(0, 10000, (args.context_len * 20,)))
+    all_x, all_y = get_batch(arr, BATCH_SIZE, args.context_len, args.device)
+
+    local_bs = all_x.size(0) // world_size
+    offset = rank * local_bs
+
+    model_start_time = time.time()
+    for _ in range(num_epochs):
+        optimizer.zero_grad()
+        ddp_data = all_x[offset : offset + local_bs, :]
+        ddp_labels = all_y[offset : offset + local_bs, :]
+        ddp_out = model(ddp_data)
+
+        out = ddp_out.flatten(0, 1)
+        ddp_labels = ddp_labels.flatten(0, 1)
+
+        ddp_loss = cross_entropy(out, ddp_labels)
+
+        ddp_loss.backward()
+        optimizer.step()
+
+    model_elapsed = time.time() - model_start_time
+    print(f"avg model epoch time {model_elapsed / num_epochs}")
+    print(f"snapshooting now")
+    # snap = torch.cuda.memory._snapshot()
+    # print(f"[Rank {rank}] memory records: {snap.num_records}")
+
+    torch.cuda.memory._dump_snapshot(f"memory_snapshot_{dist.get_rank()}.pickle")
+    torch.cuda.memory._record_memory_history(enabled=None)
+    print(f" done done ")
+    _cleanup_process_group()
+
+
 def naive_ddp():
     torch.random.manual_seed(42)
     world_size = 2
 
     # mp.spawn(_naive_ddp, args=(world_size, ToyModel), nprocs=2, join=True)
     args = get_args()
-    mp.spawn(_train_xl_ddp_benchmark, args=(world_size, BasicsTransformerLM, args, True), nprocs=2, join=True)
+    # mp.spawn(_train_xl_ddp_benchmark, args=(world_size, BasicsTransformerLM, args, True), nprocs=2, join=True)
+    mp.spawn(_mp_memory_profile_shard, args=(world_size, args), nprocs=2, join=True)
 
 
 if __name__ == "__main__":

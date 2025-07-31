@@ -31,14 +31,22 @@ class OptimizerStateSharding(torch.optim.Optimizer):
     def step(self, closure: Callable | None = None, **kwargs):
         self.optimizer.step(closure=closure, **kwargs)
         # after step, need to broadcast my updated params
+        handles = []
         for param in self.params:
-            dist.broadcast(param.data, src=self.param_to_rank[param])
+            handle = dist.broadcast(param.data, src=self.param_to_rank[param], async_op=True)
+            handles.append(handle)
+
+        for handle in handles:
+            handle.wait()
 
     def zero_grad(self, set_to_none=True):
         self.optimizer.zero_grad(set_to_none=False)
-        for param in self.params:
-            if param.requires_grad and param.grad is not None:
-                dist.broadcast(param.grad, src=self.param_to_rank[param])
+        for p in self.params:
+            if p.grad is not None:
+                if set_to_none:
+                    p.grad = None
+                else:
+                    p.grad.zero_()
 
     def _add_param(self, param: Tensor):
         cur_min = min(enumerate(self.rank_loads), key=lambda x: (x[1], x[0]))
