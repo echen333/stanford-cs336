@@ -31,7 +31,7 @@ def run_tokenize_prompt_and_output(
             "response_mask": torch.Tensor of shape (batch_size, max(prompt_and_output_lens) - 1):
                 a mask on the response tokens in `labels`.
     """
-    from cs336_alignment.sft import run_tokenize_prompt_and_output
+    from cs336_alignment.utils import run_tokenize_prompt_and_output
 
     return run_tokenize_prompt_and_output(prompt_strs, output_strs, tokenizer)
 
@@ -84,7 +84,7 @@ def run_compute_group_normalized_rewards(
 
 def run_compute_entropy(logits: torch.Tensor) -> torch.Tensor:
     """Get the entropy of the logits (i.e., entropy of the final dimension)."""
-    from cs336_alignment.sft import compute_entropy
+    from cs336_alignment.utils import compute_entropy
 
     return compute_entropy(logits)
 
@@ -118,7 +118,7 @@ def run_get_response_log_probs(
                 we have not masked out the token indices corresponding to the prompt
                 or padding; that is done in the train loop.
     """
-    from cs336_alignment.sft import get_response_log_probs
+    from cs336_alignment.utils import get_response_log_probs
 
     return get_response_log_probs(model, input_ids, labels, return_token_entropy)
 
@@ -211,7 +211,7 @@ def run_sft_microbatch_train_step(
     normalize_constant: int | None = 1.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute the policy gradient loss and backprop its gradients for a microbatch."""
-    from cs336_alignment.sft import run_sft_microbatch_train_step
+    from cs336_alignment.utils import run_sft_microbatch_train_step
 
     return run_sft_microbatch_train_step(
         policy_log_probs, response_mask, gradient_accumulation_steps, normalize_constant
@@ -279,7 +279,7 @@ def run_masked_normalize(
         torch.Tensor, the normalized sum, where masked elements
             (mask=0) don't contribute to the sum.
     """
-    from cs336_alignment.sft import masked_normalize
+    from cs336_alignment.utils import masked_normalize
 
     return masked_normalize(tensor, mask, dim, normalize_constant)
 
