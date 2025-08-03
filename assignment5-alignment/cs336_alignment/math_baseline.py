@@ -25,12 +25,14 @@ def evaluate_vllm(
     for output, label in zip(outputs, labels):
         reward = reward_fn(output.outputs[0].text, label)
         rewards.append(reward)
-        print("NEW ITEM", output, "\n LABEL:", label, "\n REWARD:", reward)
+        # print("NEW ITEM", output, "\n LABEL:", label, "\n REWARD:", reward)
 
     df = pd.DataFrame(rewards)
-    print(df)
     os.makedirs("data/", exist_ok=True)
     df.to_pickle(f"data/evaluation_df_{datetime.datetime.now().strftime('%H:%M:%S')}")
+    
+    avg_reward = df["reward"].mean()
+    return df, avg_reward
 
 
 def get_prompt_template(path: str):
