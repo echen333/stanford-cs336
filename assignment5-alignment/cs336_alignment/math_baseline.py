@@ -19,13 +19,14 @@ def evaluate_vllm(
     compute evaluation metrics, and serialize results to disk.
     """
     outputs = vllm_model.generate(prompts, eval_sampling_params)
+    # print(f"outputs {outputs}")
+    # breakpoint()
     assert len(outputs) == len(labels), "prompts len and labels len must match"
 
     rewards = []
     for output, label in zip(outputs, labels):
         reward = reward_fn(output.outputs[0].text, label)
         rewards.append(reward)
-        print("NEW ITEM", output.outputs[0].text, "\n LABEL:", label, "\n REWARD:", reward, flush=True)
 
     df = pd.DataFrame(rewards)
     os.makedirs("data/", exist_ok=True)

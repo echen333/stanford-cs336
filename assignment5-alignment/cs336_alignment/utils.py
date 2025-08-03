@@ -41,10 +41,8 @@ def run_tokenize_prompt_and_output(
 
 def compute_entropy(logits: Tensor):
     assert logits.ndim == 3
-    sub_max = logits - logits.max(-1, keepdim=True)[0]
-    exp_sub = torch.exp(sub_max)
-    p = exp_sub / torch.sum(exp_sub, -1).unsqueeze(-1)
-    ans = torch.sum(p * torch.log(p), -1)
+    normalized = F.log_softmax(logits, -1)
+    ans = torch.sum(torch.exp(normalized) * normalized, -1)
     return -ans
 
 
@@ -63,8 +61,8 @@ def get_response_log_probs(
 
     logits = logits.flatten(0, 1)
     labels = labels.flatten()
-    logits = F.log_softmax(logits)
-    log_probs: Tensor = logits[torch.arange(labels.numel()), labels]
+
+    log_probs = -F.cross_entropy(logits, labels, reduction='none')
     log_probs = log_probs.unflatten(0, (B, C))
     ret["log_probs"] = log_probs
 

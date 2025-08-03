@@ -17,8 +17,6 @@ from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 from vllm import SamplingParams
 from datasets import load_dataset
 import multiprocessing as mp
-import wandb
-import os
 
 
 def run_eval_worker(output_dir, step, dataset, sampling_params, run_id):
@@ -32,16 +30,16 @@ def run_eval_worker(output_dir, step, dataset, sampling_params, run_id):
 
     prompt_template = get_prompt_template("cs336_alignment/prompts/r1_zero.prompt")
     
+    NUM_ITEMS = 500
     df, avg_reward = evaluate_vllm(
         llm,
         r1_zero_reward_fn,
-        [get_prompt(prompt_template, x) for x in dataset["problem"][:20]],
-        dataset["solution"][:20],
+        [get_prompt(prompt_template, x) for x in dataset["problem"][:NUM_ITEMS]],
+        dataset["solution"][:NUM_ITEMS],
         eval_sampling_params=sampling_params,
     )
     print(f"finished evluating")
 
-    print(df)
     logging_path = "data/wandb_tmp.jsonl"
     with open(logging_path, "w") as f:
         obj = {
@@ -55,19 +53,20 @@ def run_eval_worker(output_dir, step, dataset, sampling_params, run_id):
 def main():
     cfg = {
         "gradient_accumulation_steps": 16,
-        "batch_size": 2,
-        "train_steps": 20000,
+        "batch_size": 1,
+        "train_steps": 1800,
         "device": "cuda:0",
-        "lr": 2e-7,
-        "seed": 22,
-        "validation_steps": 100,
+        "lr": 2e-4,
+        "seed": 42,
+        "validation_steps": 120,
+        "dataset_size": 128
     }
     device = cfg["device"]
     torch.manual_seed(cfg["seed"])
     output_dir = "data/echen333/model"
     eval_proc = None
 
-    run = wandb.init(entity="eddys", project="stanford-lm-5", config=cfg)
+    run = wandb.init(entity="eddys", project="stanford-lm-5", config=cfg, group="sft")
     run_id = run.id
 
     model_id = "Qwen/Qwen2.5-Math-1.5B"
@@ -82,14 +81,12 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     optimizer = AdamW(model.parameters(), cfg["lr"])
 
-    wandb.define_metric("train_step")  # the x‑axis for training
-    wandb.define_metric("eval_step")  # the x‑axis for evaluation
-
-    # everything that starts with train/ is tied to train_step
+    wandb.define_metric("train_step")  
+    wandb.define_metric("eval_step")  
     wandb.define_metric("train/*", step_metric="train_step")
-
-    # everything that starts with eval/ is tied to eval_step
     wandb.define_metric("eval/*", step_metric="eval_step")
+
+    torch.autograd.set_detect_anomaly(True)
 
     sft_data_path = "data/my_sft.jsonl"
     data = []
@@ -99,6 +96,8 @@ def main():
             if len(obj.strip()) == 0:
                 break
             data.append(json.loads(obj))
+    data = data[:cfg["dataset_size"]]
+    print("ELN DATA", len(data))
 
     sampling_params = SamplingParams(
         temperature=1.0, top_p=1.0, max_tokens=1024, stop=["\n"]
@@ -117,12 +116,6 @@ def main():
     print("len", all_input_ids.shape, all_labels.shape)
     response_mask = tokenized["response_mask"].to(device)
 
-    # ctx = mp.get_context("spawn")
-    # p = ctx.Process(target=run_eval_worker, args=(output_dir, 1.0 / cfg["validation_steps"], dataset, sampling_params))
-    # p.start()
-
-    # return
-    # print("MEM 1", torch.cuda.memory_allocated("cuda:0"))
     for step in range(1, cfg["train_steps"] + 1):
         print(f"step {step}")
         inds = torch.randint(0, len(all_input_ids), (cfg["batch_size"], ))
@@ -130,13 +123,21 @@ def main():
         labels = all_labels[inds]
         mask = response_mask[inds]
 
-        res = get_response_log_probs(model, input_ids, labels, False)
-        log_probs = res["log_probs"]
-        # avg_entropy = torch.mean(res["token_entropy"])
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            res = get_response_log_probs(model, input_ids, labels, True)
 
-        loss, _ = run_sft_microbatch_train_step(
-            log_probs, mask, cfg["gradient_accumulation_steps"]
-        )
+
+            logits = res["log_probs"]
+            if torch.isnan(logits).any() or torch.isinf(logits).any():
+                print(f"Step {step}: NaN/inf found in model logits!")
+
+                breakpoint()
+            avg_entropy = torch.mean(res["token_entropy"])
+
+            loss, _ = run_sft_microbatch_train_step(
+                logits, mask, cfg["gradient_accumulation_steps"]
+            )
+
 
         if step % cfg["gradient_accumulation_steps"] == 0:
             print("CLIP AND STEP")
@@ -146,7 +147,7 @@ def main():
 
         wandb_log = {
             "train/loss": loss.item(),
-            # "train/entropy": avg_entropy,
+            "train/entropy": avg_entropy,
             "train_step": step,
         }
 
@@ -172,7 +173,7 @@ def main():
                 target=run_eval_worker,
                 args=(
                     output_dir,
-                    step / cfg["validation_steps"],
+                    step,
                     dataset,
                     sampling_params,
                     run_id
@@ -182,6 +183,11 @@ def main():
 
 
         wandb.log(wandb_log)
+    print("going through wandb log for final time now")
+    with open("data/wandb_tmp.jsonl", "r") as f:
+        objs = f.readlines()
+        for obj in objs:
+            wandb.log(json.loads(obj))
     
 
 
