@@ -1,7 +1,14 @@
 import torch
 import wandb
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
-from cs336_alignment.utils import run_sft_microbatch_train_step, log_generations, get_response_log_probs, run_tokenize_prompt_and_output, load_policy_into_vllm_instance, init_vllm
+from cs336_alignment.utils import (
+    run_sft_microbatch_train_step,
+    log_generations,
+    get_response_log_probs,
+    run_tokenize_prompt_and_output,
+    load_policy_into_vllm_instance,
+    init_vllm,
+)
 import json
 from torch.optim import AdamW
 import pdb
@@ -11,13 +18,20 @@ from vllm import SamplingParams
 from datasets import load_dataset
 import multiprocessing as mp
 
+
 def run_eval_worker(output_dir, step, dataset, sampling_params):
     model = AutoModelForCausalLM.from_pretrained(output_dir).to("cuda:1")
     print(f"running eval worker now {output_dir}")
     llm = init_vllm(output_dir, "cuda:1", 42)
     load_policy_into_vllm_instance(model, llm)
 
-    df, avg_reward = evaluate_vllm(llm, r1_zero_reward_fn, dataset["problem"][:20], dataset["solution"][:20], eval_sampling_params=sampling_params)
+    df, avg_reward = evaluate_vllm(
+        llm,
+        r1_zero_reward_fn,
+        dataset["problem"][:20],
+        dataset["solution"][:20],
+        eval_sampling_params=sampling_params,
+    )
     print(f"finished evluating")
 
     print(df)
@@ -27,9 +41,10 @@ def run_eval_worker(output_dir, step, dataset, sampling_params):
     #     "eval/format_reward": df["format_reward"].mean()
     # })
 
+
 def main():
     cfg = {
-        "gradient_accumulation_steps": 1, 
+        "gradient_accumulation_steps": 1,
         "batch_size": 16,
         "train_steps": 300,
         "device": "cuda:0",
@@ -63,9 +78,12 @@ def main():
 
     sft_data_path = "data/my_sft.jsonl"
     data = []
-    with open(sft_data_path, "r") as f:
-        obj = f.readline()
-        data.append(json.loads(obj))
+    with open(sft_data_path) as f:
+        while True:
+            obj = f.readline()
+            if len(obj.strip()) == 0:
+                break
+            data.append(json.loads(obj))
 
     sampling_params = SamplingParams(
         temperature=1.0, top_p=1.0, max_tokens=1024, stop=["\n"]
@@ -83,19 +101,19 @@ def main():
     labels = tokenized["labels"].to(device)
     response_mask = tokenized["response_mask"].to(device)
 
-
     # ctx = mp.get_context("spawn")
     # p = ctx.Process(target=run_eval_worker, args=(output_dir, 1.0 / cfg["validation_steps"], dataset, sampling_params))
     # p.start()
 
     # return
     for step in range(1, cfg["train_steps"] + 1):
-
         res = get_response_log_probs(model, input_ids, labels, True)
         log_probs = res["log_probs"]
         avg_entropy = torch.mean(res["token_entropy"])
 
-        loss, _ = run_sft_microbatch_train_step(log_probs, response_mask, cfg["gradient_accumulation_steps"])
+        loss, _ = run_sft_microbatch_train_step(
+            log_probs, response_mask, cfg["gradient_accumulation_steps"]
+        )
 
         if step % cfg["gradient_accumulation_steps"] == 0:
             optimizer.step()
@@ -119,13 +137,20 @@ def main():
             tokenizer.save_pretrained(save_directory=output_dir)
 
             ctx = mp.get_context("spawn")
-            p = ctx.Process(target=run_eval_worker, args=(output_dir, step / cfg["validation_steps"], dataset, sampling_params))
+            p = ctx.Process(
+                target=run_eval_worker,
+                args=(
+                    output_dir,
+                    step / cfg["validation_steps"],
+                    dataset,
+                    sampling_params,
+                ),
+            )
             p.start()
-
 
         # print(entropy.dtype, log_probs)
         wandb.log(wandb_log)
-        
+
+
 if __name__ == "__main__":
     main()
-

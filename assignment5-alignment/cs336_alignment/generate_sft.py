@@ -20,7 +20,7 @@ dataset = load_dataset("DigitalLearningGmbH/MATH-lighteval", split="test")
 arr = []
 
 
-def ask_model(problem):
+def ask_model(problem, solution):
     messages = [{"role": "user", "content": problem}]
     completions = client.chat.completions.create(
         model="openai/gpt-4o",
@@ -28,7 +28,7 @@ def ask_model(problem):
     )
     prompt = problem
     response_text = completions.choices[0].message.content
-    return prompt, response_text
+    return prompt, response_text, solution
 
 
 def get_prompt_template(path: str):
@@ -42,23 +42,23 @@ def get_prompt(prompt_template: str, question):
 
 
 prompt_template = get_prompt_template("cs336_alignment/prompts/r1_zero.prompt")
+dataset.shuffle(42)
 with ThreadPoolExecutor(10) as executor:
     futures = [
-        executor.submit(ask_model, get_prompt(prompt_template, item["problem"]))
-        for item in dataset.select(range(1024))
+        executor.submit(
+            ask_model, get_prompt(prompt_template, item["problem"]), item["solution"]
+        )
+        for item in dataset.select(range(256))
     ]
 
     for future in as_completed(futures):
-        (
-            problem,
-            response,
-        ) = future.result()
+        (problem, response, solution) = future.result()
         print(f"finished {problem}")
-        arr.append({"prompt": problem, "response": response})
+        arr.append({"prompt": problem, "response": response, "solution": solution})
 
 print("arr", arr)
 
-path = "data/my_sft.jsonl"
+path = "data/my_sft2.jsonl"
 with open(path, "w") as f:
     for obj in arr:
         f.write(json.dumps(obj) + "\n")
