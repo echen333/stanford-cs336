@@ -25,7 +25,7 @@ def evaluate_vllm(
     for output, label in zip(outputs, labels):
         reward = reward_fn(output.outputs[0].text, label)
         rewards.append(reward)
-        # print("NEW ITEM", output, "\n LABEL:", label, "\n REWARD:", reward)
+        print("NEW ITEM", output.outputs[0].text, "\n LABEL:", label, "\n REWARD:", reward, flush=True)
 
     df = pd.DataFrame(rewards)
     os.makedirs("data/", exist_ok=True)

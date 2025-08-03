@@ -12,45 +12,55 @@ from cs336_alignment.utils import (
 import json
 from torch.optim import AdamW
 import pdb
-from cs336_alignment.math_baseline import evaluate_vllm
+from cs336_alignment.math_baseline import evaluate_vllm, get_prompt, get_prompt_template
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 from vllm import SamplingParams
 from datasets import load_dataset
 import multiprocessing as mp
+import wandb
+import os
 
 
-def run_eval_worker(output_dir, step, dataset, sampling_params):
-    model = AutoModelForCausalLM.from_pretrained(output_dir).to("cuda:1")
+def run_eval_worker(output_dir, step, dataset, sampling_params, run_id):
+
+    torch.cuda.set_device(1)
+    torch.cuda.empty_cache()
+    model = AutoModelForCausalLM.from_pretrained(output_dir)
     print(f"running eval worker now {output_dir}")
     llm = init_vllm(output_dir, "cuda:1", 42)
     load_policy_into_vllm_instance(model, llm)
 
+    prompt_template = get_prompt_template("cs336_alignment/prompts/r1_zero.prompt")
+    
     df, avg_reward = evaluate_vllm(
         llm,
         r1_zero_reward_fn,
-        dataset["problem"][:20],
+        [get_prompt(prompt_template, x) for x in dataset["problem"][:20]],
         dataset["solution"][:20],
         eval_sampling_params=sampling_params,
     )
     print(f"finished evluating")
 
     print(df)
-    # wandb.log({
-    #     "eval_step": step,
-    #     "eval/avg_reward": avg_reward,
-    #     "eval/format_reward": df["format_reward"].mean()
-    # })
+    logging_path = "data/wandb_tmp.jsonl"
+    with open(logging_path, "w") as f:
+        obj = {
+            "eval_step": step,
+            "eval/avg_reward": avg_reward,
+            "eval/format_reward": df["format_reward"].mean()
+        }
+        f.write(json.dumps(obj) + '\n')
 
 
 def main():
     cfg = {
-        "gradient_accumulation_steps": 1,
-        "batch_size": 16,
-        "train_steps": 300,
+        "gradient_accumulation_steps": 16,
+        "batch_size": 2,
+        "train_steps": 20000,
         "device": "cuda:0",
-        "lr": 2e-3,
-        "seed": 42,
-        "validation_steps": 50,
+        "lr": 2e-7,
+        "seed": 22,
+        "validation_steps": 100,
     }
     device = cfg["device"]
     torch.manual_seed(cfg["seed"])
@@ -58,12 +68,17 @@ def main():
     eval_proc = None
 
     run = wandb.init(entity="eddys", project="stanford-lm-5", config=cfg)
+    run_id = run.id
+
     model_id = "Qwen/Qwen2.5-Math-1.5B"
+    torch.cuda.set_device(0)
+
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-    ).to(device)
+        attn_implementation="flash_attention_2"
+    )
+    model = model.to(device)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     optimizer = AdamW(model.parameters(), cfg["lr"])
 
@@ -92,13 +107,14 @@ def main():
     sampling_params.include_stop_str_in_output = True
 
     dataset = load_dataset("DigitalLearningGmbH/MATH-lighteval", split="test")
-    dataset = dataset.shuffle(seed=42)
+    dataset = dataset.shuffle(seed=cfg["seed"])
 
     prompt_strs = [x["prompt"] for x in data]
     output_strs = [x["response"] for x in data]
     tokenized = run_tokenize_prompt_and_output(prompt_strs, output_strs, tokenizer)
-    input_ids = tokenized["input_ids"].to(device)
-    labels = tokenized["labels"].to(device)
+    all_input_ids = tokenized["input_ids"].to(device)
+    all_labels = tokenized["labels"].to(device)
+    print("len", all_input_ids.shape, all_labels.shape)
     response_mask = tokenized["response_mask"].to(device)
 
     # ctx = mp.get_context("spawn")
@@ -106,23 +122,31 @@ def main():
     # p.start()
 
     # return
+    # print("MEM 1", torch.cuda.memory_allocated("cuda:0"))
     for step in range(1, cfg["train_steps"] + 1):
-        res = get_response_log_probs(model, input_ids, labels, True)
+        print(f"step {step}")
+        inds = torch.randint(0, len(all_input_ids), (cfg["batch_size"], ))
+        input_ids = all_input_ids[inds]
+        labels = all_labels[inds]
+        mask = response_mask[inds]
+
+        res = get_response_log_probs(model, input_ids, labels, False)
         log_probs = res["log_probs"]
-        avg_entropy = torch.mean(res["token_entropy"])
+        # avg_entropy = torch.mean(res["token_entropy"])
 
         loss, _ = run_sft_microbatch_train_step(
-            log_probs, response_mask, cfg["gradient_accumulation_steps"]
+            log_probs, mask, cfg["gradient_accumulation_steps"]
         )
 
         if step % cfg["gradient_accumulation_steps"] == 0:
+            print("CLIP AND STEP")
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad()
-        # print(f"loss {loss.item()}")
 
         wandb_log = {
             "train/loss": loss.item(),
-            "train/entropy": avg_entropy,
+            # "train/entropy": avg_entropy,
             "train_step": step,
         }
 
@@ -132,25 +156,38 @@ def main():
                 eval_proc.join()
                 eval_proc = None
 
+            if step != cfg["validation_steps"]:
+                print("going through wandb log now")
+                with open("data/wandb_tmp.jsonl", "r") as f:
+                    objs = f.readlines()
+                    for obj in objs:
+                        wandb.log(json.loads(obj))
+
             print(f"starting new saving and process")
             model.save_pretrained(save_directory=output_dir)
             tokenizer.save_pretrained(save_directory=output_dir)
 
             ctx = mp.get_context("spawn")
-            p = ctx.Process(
+            eval_proc = ctx.Process(
                 target=run_eval_worker,
                 args=(
                     output_dir,
                     step / cfg["validation_steps"],
                     dataset,
                     sampling_params,
+                    run_id
                 ),
             )
-            p.start()
+            eval_proc.start()
 
-        # print(entropy.dtype, log_probs)
+
         wandb.log(wandb_log)
+    
+
 
 
 if __name__ == "__main__":
+    import gc
+    import torch
+    gc.collect()
     main()
