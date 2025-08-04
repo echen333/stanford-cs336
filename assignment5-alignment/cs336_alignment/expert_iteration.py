@@ -1,7 +1,7 @@
 import torch
 import wandb
 import multiprocessing as mp
-from vllm import SamplingParams
+from vllm import SamplingParams, LLM
 from datasets import load_dataset
 import json
 from torch.optim import AdamW
@@ -12,28 +12,37 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import pdb
 
 def run_sampling_worker(output_dir, sampling_params, dataset, exit_batch_size, step):
-    torch.cuda.set_device(1)
-    torch.cuda.empty_cache()
     model = AutoModelForCausalLM.from_pretrained(output_dir)
     print(f"running eval worker now {output_dir}")
-    llm = init_vllm(output_dir, "cuda:1", 42)
+    llm: LLM = init_vllm(output_dir, "cuda:0", 42)
     load_policy_into_vllm_instance(model, llm)
 
     prompt_template = get_prompt_template("cs336_alignment/prompts/r1_zero.prompt")
     
     NUM_ITEMS = exit_batch_size
-    df, avg_reward = evaluate_vllm(
-        llm,
-        r1_zero_reward_fn,
-        [get_prompt(prompt_template, x) for x in dataset["problem"][:NUM_ITEMS]],
-        dataset["solution"][:NUM_ITEMS],
-        eval_sampling_params=sampling_params,
-    )
-    return df, avg_reward
+    prompts = [get_prompt(prompt_template, x) for x in dataset["problem"][:NUM_ITEMS]]
+    labels = dataset["solution"][:NUM_ITEMS]
+    outputs = llm.generate(prompts, sampling_params)
+    assert len(outputs) == len(prompts)
+    
+    data_arr = []
+    for output, label in zip(outputs, labels):
+        for ind in range(len(output.outputs)):
+            reward = r1_zero_reward_fn(output.outputs[ind].text, label)
+            if reward["reward"] > 0.99:
+                data_arr.append({
+                    "problem": output.prompt,
+                    "solution": output.outputs[ind].text
+                })
+                break
+    
+    acc = len(data_arr) / NUM_ITEMS
+    torch.cuda.empty_cache()
 
+    return acc, data_arr
 
 def run_sft(cfg, model, all_input_ids, all_labels, response_mask):
-    optimizer = AdamW(model.parameters())
+    optimizer = AdamW(model.parameters(), lr=cfg["lr"])
     for step in range(1, cfg["sft_steps"] + 1):
         inds = torch.randint(0, len(all_input_ids), (cfg["sft_batch_size"], ))
         input_ids = all_input_ids[inds]
@@ -45,12 +54,10 @@ def run_sft(cfg, model, all_input_ids, all_labels, response_mask):
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             res = get_response_log_probs(model, input_ids, labels, True)
 
-
             logits = res["log_probs"]
             if torch.isnan(logits).any() or torch.isinf(logits).any():
                 print(f"Step {step}: NaN/inf found in model logits!")
 
-                breakpoint()
             avg_entropy = torch.mean(res["token_entropy"])
 
             loss, _ = run_sft_microbatch_train_step(
@@ -65,40 +72,24 @@ def run_sft(cfg, model, all_input_ids, all_labels, response_mask):
             optimizer.zero_grad()
 
         wandb_log = {
-            "train/loss": loss.item(),
-            "train/entropy": avg_entropy,
-            "train_step": step,
+            "sft/loss": loss.item(),
+            "sft/entropy": avg_entropy,
+            "sft": step,
         }
-
-        if step % cfg["validation_steps"] == 0:
-            if eval_proc is not None:
-                print(f"Waiting for last eval process to finish.")
-                eval_proc.join()
-                eval_proc = None
-
-            if step != cfg["validation_steps"]:
-                print("going through wandb log now")
-                with open("data/wandb_tmp.jsonl", "r") as f:
-                    objs = f.readlines()
-                    for obj in objs:
-                        wandb.log(json.loads(obj))
-
-            print(f"starting new saving and process")
 
         wandb.log(wandb_log)
 
 def main():
     cfg = {
-        "sft_gradient_accumulation_steps": 16,
-        "exit_batch_size": 2048,
+        "gradient_accumulation_steps": 16,
+        "exit_batch_size": 512,
         "sft_batch_size": 1,
-        "sft_steps": 180,
+        "sft_steps": 96,
         "device": "cuda",
         "lr": 2e-4,
         "seed": 42,
-        "dataset_size": 1024,
         "n_ei_steps": 5,
-        "G": 5
+        "G": 5,
     }
     device = cfg["device"]
     torch.manual_seed(cfg["seed"])
@@ -126,27 +117,42 @@ def main():
     dataset = load_dataset("DigitalLearningGmbH/MATH-lighteval", split="test")
     dataset = dataset.shuffle(seed=cfg["seed"])
 
+    wandb.define_metric("exit_step")  
+    wandb.define_metric("sft_step")  
+    wandb.define_metric("exit/*", step_metric="exit_step")
+    wandb.define_metric("sft/*", step_metric="sft_step")
+
     for exit_step in range(1, cfg["n_ei_steps"] + 1):
 
-        dataset.shuffle(seed=exit_step)
-        df, avg_reward = run_sampling_worker(None,sampling_params, dataset, cfg["exit_batch_size"], exit_step)
-        print("finished sampling", df.head(), avg_reward)
+        output_dir = "data/echen333/exit_model"
+        model.save_pretrained(save_directory=output_dir)
+        tokenizer.save_pretrained(save_directory=output_dir)
 
-        breakpoint()
-        inds = df[df["reward"] > 0.99].index
-        prompt_strs = [dataset["prompts"][ind] for ind in inds]
-        output_strs = [dataset["solution"][ind] for ind in inds]
+        model.to("cpu")
+        torch.cuda.empty_cache()
+
+        dataset.shuffle(seed=exit_step)
+        avg_reward, data_arr = run_sampling_worker(output_dir,sampling_params, dataset, cfg["exit_batch_size"], exit_step)
+        assert len(data_arr) !=0, "found no successful trajectories!"
+        print("finished sampling", avg_reward)
+
+        prompt_strs = [x["problem"] for x in data_arr]
+        output_strs = [x["solution"] for x in data_arr]
 
         tokenized = run_tokenize_prompt_and_output(prompt_strs, output_strs, tokenizer)
+
         input_ids = tokenized["input_ids"].to(device)
         labels = tokenized["labels"].to(device)
         print("len", input_ids.shape, labels.shape)
         mask = tokenized["response_mask"].to(device)
 
+        model.to("cuda")
+        torch.cuda.empty_cache()
         run_sft(cfg, model, input_ids, labels, mask)
 
         wandb_log = {
-            "reward": avg_reward,
+            "exit/reward": avg_reward,
+            "exit/exit_step": exit_step
         }
         wandb.log(wandb_log)
 
