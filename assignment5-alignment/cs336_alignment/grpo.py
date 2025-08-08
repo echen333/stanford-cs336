@@ -9,7 +9,7 @@ def compute_group_normalized_rewards(
     group_size: int,
     advantage_eps: float,
     normalize_by_std: bool,
-) -> tuple[torch.Tensor, dict[str, float]]:
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
     raw_rewards = torch.tensor(
         [
             reward_fn(response, ground_truth)["reward"]
@@ -71,9 +71,7 @@ def grpo_microbatch_train_step(
     old_log_probs: torch.Tensor | None = None,
     cliprange: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    token_loss, metadata = compute_policy_gradient_loss(
-        policy_log_probs, loss_type, raw_rewards, advantages, old_log_probs, cliprange
-    )
+    token_loss, metadata = compute_policy_gradient_loss(policy_log_probs, loss_type, raw_rewards, advantages, old_log_probs, cliprange)
     loss = masked_mean(token_loss, response_mask) / (gradient_accumulation_steps)
     loss.backward()
     return loss, metadata
@@ -82,10 +80,10 @@ def grpo_microbatch_train_step(
 def compute_policy_gradient_loss(
     policy_log_probs: torch.Tensor,
     loss_type: str,
-    raw_rewards: torch.Tensor,
-    advantages: torch.Tensor,
-    old_log_probs: torch.Tensor,
-    cliprange: float,
+    raw_rewards: torch.Tensor | None = None,
+    advantages: torch.Tensor | None = None,
+    old_log_probs: torch.Tensor | None = None,
+    cliprange: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     if loss_type == "no_baseline":
         return compute_naive_policy_gradient_loss(raw_rewards, policy_log_probs), {}
