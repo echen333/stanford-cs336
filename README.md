@@ -8,7 +8,7 @@ Organic, artisanal, handwritten code for Stanford's CS 336 (Spring 2025) - a cou
 
 This repository contains my implementations for three assignments from CS 336, where students build every component of a modern language model with minimal scaffolding. Each assignment took maybe 40-80 hours and cost under $100 to complete (mostly for rented gpu compute).
 
-Most of my thoughts align with [andytimm](https://andytimm.github.io/posts/cs336/cs336_review.html). You should be very proficient in python, and assignments 1,2, and 5 definitely take a lot of time and . Personally, I chose to not use any LLM's to write code but did use it a lot to brainstorm.
+Most of my thoughts align with [andytimm](https://andytimm.github.io/posts/cs336/cs336_review.html). You should be very proficient in python, and assignments 1, 2, and 5 definitely take a lot of time and effort. Personally, I chose to not use any LLM's to write code but did use it a lot to brainstorm.
 
 ## Assignments
 
@@ -37,4 +37,4 @@ Align language models on math dataset using supervised fine-tuning, expert itera
 
 ## Acknowledgments
 
-Thank you very much to the Stanford CS336 teaching team. Course materials and starter code provided by them on their github. All code are implementations following the assignment specs.
+Thank you very much to the Stanford CS336 teaching team for their high quality lecture and assignments. Course materials and starter code provided by them on their github.
